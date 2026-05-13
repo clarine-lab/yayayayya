@@ -1,17 +1,12 @@
 import os
+import time
 import json
 import requests
 from flask import Flask, request, jsonify, Response, stream_with_context
 from flask_cors import CORS
 
 API_KEY = os.getenv("API_KEY")
-
-# Safety checks for the logs
-if not API_KEY:
-    print("❌ WARNING: API_KEY is missing from environment variables!")
-elif not API_KEY.startswith("nvapi-"):
-    print("⚠️ WARNING: API_KEY does not have the expected 'nvapi-' prefix.")
-
+# Case sensitivity: Some NIM versions prefer lowercase 'pro'
 DEFAULT_MODEL = "deepseek-ai/deepseek-v4-pro"
 NIM_ENDPOINT = "https://integrate.api.nvidia.com/v1/chat/completions"
 
@@ -20,25 +15,27 @@ CORS(app)
 
 @app.route('/', methods=["GET"])
 def health_check():
-    return jsonify({"status": "online", "message": "NVIDIA Multi-Model Proxy Active"}), 200
+    return "NVIDIA Pro-Ready Proxy Online", 200
 
 @app.route('/v1/chat/completions', methods=["POST"])
+@app.route('/chat/completions', methods=["POST"])
 def handle_proxy():
     try:
         data = request.get_json()
+        messages = data.get('messages', [])
         current_model = data.get("model", DEFAULT_MODEL)
 
         payload = {
             "model": current_model,
-            "messages": data.get('messages', []),
-            "stream": True,
+            "messages": messages,
+            "stream": True, # Force streaming for Pro
             "temperature": data.get("temperature", 0.9),
-            "max_tokens": data.get("max_tokens", 4096)
+            "max_tokens": data.get("max_tokens", 4096),
+            "chat_template_kwargs": {
+                "enable_thinking": True,
+                "thinking": True
+            }
         }
-
-        # Add 'thinking' parameters only for Pro models
-        if "pro" in current_model.lower():
-            payload["chat_template_kwargs"] = {"enable_thinking": True, "thinking": True}
 
         headers = {
             "Authorization": f"Bearer {API_KEY}",
@@ -46,42 +43,26 @@ def handle_proxy():
         }
 
         def stream_response():
-            # Initial heartbeat
+            # --- THE HEARTBEAT HACK ---
+            # Send an SSE comment immediately. Standard RP tools (SillyTavern/Janitor) 
+            # ignore lines starting with ':', but the HF Gateway sees this as "data" 
+            # and keeps the connection alive.
             yield ": connection established\n\n"
-            
+            yield ": model is thinking...\n\n"
+
             try:
+                # Use a longer read timeout for Pro (600s)
                 with requests.post(NIM_ENDPOINT, headers=headers, json=payload, stream=True, timeout=(15, 600)) as r:
                     if r.status_code != 200:
-                        err_snippet = r.raw.read(500).decode('utf-8', 'ignore')
-                        yield f"data: {json.dumps({'error': 'NVIDIA Error', 'details': err_snippet})}\n\n"
+                        yield f"data: {json.dumps({'error': 'NVIDIA Error', 'details': r.text})}\n\n"
                         return
 
-                    for line in r.iter_lines():
-                        if not line:
-                            continue
-                            
-                        decoded_line = line.decode('utf-8').strip()
-
-                        # 1. Catch the DONE signal and terminate cleanly
-                        if "[DONE]" in decoded_line:
-                            yield "data: [DONE]\n\n"
-                            break
-
-                        # 2. Skip usage chunks completely
-                        if '"choices":[]' in decoded_line or '"usage":' in decoded_line:
-                            continue
-                            
-                        # 3. Ensure proper SSE formatting
-                        if decoded_line.startswith("data: "):
-                            yield f"{decoded_line}\n\n"
-                        else:
-                            # If it's a raw JSON string without the prefix, add it.
-                            yield f"data: {decoded_line}\n\n"
-
-            except requests.exceptions.Timeout:
-                yield f"data: {json.dumps({'error': 'NVIDIA Timeout', 'details': 'The model took too long to respond.'})}\n\n"
+                    for chunk in r.iter_lines():
+                        if chunk:
+                            # Pass through the NVIDIA tokens
+                            yield chunk.decode('utf-8') + "\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'error': 'Proxy Loop Error', 'details': str(e)})}\n\n"
+                yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
         return Response(stream_with_context(stream_response()), content_type='text/event-stream')
 
