@@ -64,20 +64,58 @@ def handle_proxy():
                             yield "data: [DONE]\n\n"
                             break
 
-                        # 2. Skip usage chunks completely
-                        if '"choices":[]' in decoded_line or '"usage":' in decoded_line:
-                            continue
-
-                        # 3. Filter out "Reasoning" chunks for JanitorAI compatibility
-                        if '"reasoning"' in decoded_line or '"reasoning_content"' in decoded_line:
-                            # We just ignore these lines completely so the front-end never sees them.
-                            continue
-                            
-                        # 4. Ensure proper SSE formatting for actual content
+                        # 2. Process only properly formatted SSE data lines
                         if decoded_line.startswith("data: "):
-                            yield f"{decoded_line}\n\n"
-                        else:
-                            yield f"data: {decoded_line}\n\n"
+                            json_str = decoded_line[6:] # Strip "data: "
+                            
+                            try:
+                                data_obj = json.loads(json_str)
+                                choices = data_obj.get("choices", [])
+                                
+                                # Filter out empty choices (NVIDIA's trailing usage chunks)
+                                if not choices:
+                                    continue
+                                    
+                                delta = choices[0].get("delta", {})
+                                finish_reason = choices[0].get("finish_reason")
+                                
+                                # Extract the actual story content (if it exists)
+                                content = delta.get("content")
+                                
+                                # If there is no story content yet, the model is still thinking
+                                if content is None and finish_reason is None:
+                                    # Send a heartbeat so JanitorAI doesn't time out
+                                    yield ": heartbeat\n\n"
+                                    continue
+                                
+                                # Rebuild a clean 'delta' that JanitorAI can easily read
+                                clean_delta = {}
+                                if content is not None:
+                                    clean_delta["content"] = content
+                                    
+                                # Rebuild the chunk to perfectly match standard OpenAI format
+                                clean_chunk = {
+                                    "id": data_obj.get("id", "chatcmpl-proxy"),
+                                    "object": "chat.completion.chunk",
+                                    "created": data_obj.get("created", 0),
+                                    "model": data_obj.get("model", current_model),
+                                    "choices": [{
+                                        "index": choices[0].get("index", 0),
+                                        "delta": clean_delta,
+                                        "finish_reason": finish_reason
+                                    }]
+                                }
+                                
+                                yield f"data: {json.dumps(clean_chunk)}\n\n"
+                                
+                            except json.JSONDecodeError:
+                                # Fallback: if NVIDIA sends weird raw text, just pass it through safely
+                                yield f"{decoded_line}\n\n"
+
+            except requests.exceptions.Timeout:
+                yield f"data: {json.dumps({'error': 'NVIDIA Timeout', 'details': 'Model took too long.'})}\n\n"
+            except Exception as e:
+                yield f"data: {json.dumps({'error': 'Proxy Loop Error', 'details': str(e)})}\n\n"
 
             except requests.exceptions.Timeout:
                 yield f"data: {json.dumps({'error': 'NVIDIA Timeout', 'details': 'The model took too long.'})}\n\n"
