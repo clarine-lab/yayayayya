@@ -50,7 +50,14 @@ def handle_proxy():
                 with requests.post(NIM_ENDPOINT, headers=headers, json=payload, stream=True, timeout=(15, 600)) as r:
                     if r.status_code != 200:
                         err_snippet = r.raw.read(500).decode('utf-8', 'ignore')
-                        yield f"data: {json.dumps({'error': 'NVIDIA Error', 'details': err_snippet})}\n\n"
+                        # Format exactly how OpenAI sends errors
+                        error_json = {
+                            "error": {
+                                "message": f"NVIDIA Error {r.status_code}: {err_snippet}",
+                                "type": "api_error"
+                            }
+                        }
+                        yield f"data: {json.dumps(error_json)}\n\n"
                         return
 
                     for line in r.iter_lines():
@@ -72,28 +79,25 @@ def handle_proxy():
                                 data_obj = json.loads(json_str)
                                 choices = data_obj.get("choices", [])
                                 
-                                # Filter out empty choices (NVIDIA's trailing usage chunks)
+                                # Filter out empty choices
                                 if not choices:
                                     continue
                                     
                                 delta = choices[0].get("delta", {})
                                 finish_reason = choices[0].get("finish_reason")
                                 
-                                # Extract the actual story content (if it exists)
                                 content = delta.get("content")
                                 
-                                # If there is no story content yet, the model is still thinking
+                                # Send heartbeat while model is "thinking"
                                 if content is None and finish_reason is None:
-                                    # Send a heartbeat so JanitorAI doesn't time out
                                     yield ": heartbeat\n\n"
                                     continue
                                 
-                                # Rebuild a clean 'delta' that JanitorAI can easily read
+                                # Rebuild clean delta
                                 clean_delta = {}
                                 if content is not None:
                                     clean_delta["content"] = content
                                     
-                                # Rebuild the chunk to perfectly match standard OpenAI format
                                 clean_chunk = {
                                     "id": data_obj.get("id", "chatcmpl-proxy"),
                                     "object": "chat.completion.chunk",
@@ -109,19 +113,15 @@ def handle_proxy():
                                 yield f"data: {json.dumps(clean_chunk)}\n\n"
                                 
                             except json.JSONDecodeError:
-                                # Fallback: if NVIDIA sends weird raw text, just pass it through safely
                                 yield f"{decoded_line}\n\n"
 
             except requests.exceptions.Timeout:
-                yield f"data: {json.dumps({'error': 'NVIDIA Timeout', 'details': 'Model took too long.'})}\n\n"
+                timeout_json = {"error": {"message": "NVIDIA Timeout: The model took too long to respond.", "type": "timeout"}}
+                yield f"data: {json.dumps(timeout_json)}\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'error': 'Proxy Loop Error', 'details': str(e)})}\n\n"
-
-            except requests.exceptions.Timeout:
-                yield f"data: {json.dumps({'error': 'NVIDIA Timeout', 'details': 'The model took too long.'})}\n\n"
-            except Exception as e:
-                yield f"data: {json.dumps({'error': 'Proxy Loop Error', 'details': str(e)})}\n\n"
-
+                loop_err_json = {"error": {"message": f"Proxy Loop Error: {str(e)}", "type": "proxy_error"}}
+                yield f"data: {json.dumps(loop_err_json)}\n\n"
+            
         return Response(stream_with_context(stream_response()), content_type='text/event-stream')
 
     except Exception as e:
